@@ -1,0 +1,215 @@
+diff --git a/hindsight-integrations/coding-agents/src/core/hindsight.ts b/hindsight-integrations/coding-agents/src/core/hindsight.ts
+index bbfa12a..960e39b 100644
+--- a/hindsight-integrations/coding-agents/src/core/hindsight.ts
++++ b/hindsight-integrations/coding-agents/src/core/hindsight.ts
+@@ -133,6 +133,9 @@ export interface ClientOpts {
+    *  wait out is an item missing from the bank — deepen used to log "failed to enqueue" and carry
+    *  on, dropping about a third of a repo's chats against a rate-limited Hindsight Cloud. */
+   rateLimitPatienceMs?: number;
++  requestTimeoutMs?: number;
++  fetchOverride?: typeof fetch;
++  strictReadStatus?: boolean;
+ }
+ 
+ export interface RetainOpts {
+@@ -391,6 +394,9 @@ export class HindsightClient {
+   readonly pageSearchLimit: number;
+   readonly recallOptions: Record<string, unknown>;
+   private readonly rateLimitPatienceMs: number;
++  private readonly requestTimeoutMs: number;
++  private readonly fetchOverride?: typeof fetch;
++  private readonly strictReadStatus: boolean;
+ 
+   constructor(o: ClientOpts) {
+     this.apiUrl = o.apiUrl.replace(/\/$/, "");
+@@ -407,6 +413,9 @@ export class HindsightClient {
+     // mutation everyone's.
+     this.recallOptions = { ...DEFAULT_RECALL_OPTIONS, ...o.recallOptions };
+     this.rateLimitPatienceMs = o.rateLimitPatienceMs ?? 0;
++    this.requestTimeoutMs = o.requestTimeoutMs ?? 15_000;
++    this.fetchOverride = o.fetchOverride;
++    this.strictReadStatus = o.strictReadStatus === true;
+   }
+ 
+   /** The credential in use, for diagnostics. Never log or report the VALUE — booleans only. */
+@@ -457,7 +466,7 @@ export class HindsightClient {
+     // Only a request with its own deadline drops undici's timeouts; the drain poll has none.
+     const dispatcher = init.signal ? signalOnlyDispatcher() : undefined;
+     const send = () =>
+-      fetch(url, { ...init, headers: this.headers(), ...(dispatcher ? { dispatcher } : {}) });
++      (this.fetchOverride ?? fetch)(url, { ...init, headers: this.headers(), ...(dispatcher ? { dispatcher } : {}) });
+     const r = await send();
+     if (r.status !== 401 || !this.refreshToken()) return r;
+     return send();
+@@ -482,7 +491,7 @@ export class HindsightClient {
+     url: string,
+     body?: unknown,
+     tolerate: number[] = [],
+-    timeoutMs = 15_000
++    timeoutMs = this.requestTimeoutMs
+   ): Promise<Response> {
+     // Hard cap on EVERY request: a stalled server (pool deadlock, network) must degrade to a
+     // memoryless turn — never hang a host that awaits us (opencode blocks its BOOT on plugin init).
+@@ -652,6 +661,10 @@ export class HindsightClient {
+     const r = await this.req("GET", this.bankUrl("/documents?limit=1"));
+     if (r.status === 404) return false;
+     const j = (await r.json()) as { items?: unknown[]; total?: number };
++    if (this.strictReadStatus && (!j || (!Array.isArray(j.items) && !Number.isSafeInteger(j.total)) ||
++        (j.total !== undefined && (!Number.isSafeInteger(j.total) || j.total < (j.items?.length ?? 0))))) {
++      throw new Error("unknown document state");
++    }
+     return (j.total ?? j.items?.length ?? 0) > 0;
+   }
+ 
+@@ -735,6 +748,7 @@ export class HindsightClient {
+   /** Count of operations still ACTIVE on this bank — the list includes terminal ops (completed/
+    *  failed/cancelled), so filter by status. Powers syncStatus's "extractions drained" check. */
+   async activeOperations(): Promise<number> {
++    if (this.strictReadStatus) return this.countBoundedOperations();
+     const r = await this.req("GET", this.bankUrl("/operations"));
+     try {
+       const j = (await r.json()) as {
+@@ -748,6 +762,38 @@ export class HindsightClient {
+     }
+   }
+ 
++  /** Missing or partial coverage is unknown, never proof that the queue has drained. */
++  private async countBoundedOperations(): Promise<number> {
++    const limit = 100;
++    const maxRows = 400;
++    const seen = new Set<string>();
++    let total: number | undefined;
++    let active = 0;
++    for (let offset = 0; offset < maxRows; offset += limit) {
++      const r = await this.req("GET", this.bankUrl(`/operations?limit=${limit}&offset=${offset}`));
++      if (!r.ok) throw new Error("unknown operation state");
++      const page = (await r.json()) as {
++        total?: number; limit?: number; offset?: number;
++        operations?: { id?: string; status?: string }[];
++      } | null;
++      if (typeof page?.total !== "number" || !Number.isSafeInteger(page.total) ||
++          page.total < offset || page.total > maxRows || (total !== undefined && total !== page.total) ||
++          page.limit !== limit || page.offset !== offset || !Array.isArray(page.operations) ||
++          page.operations.length !== Math.min(limit, page.total - offset)) {
++        throw new Error("unknown operation coverage");
++      }
++      total = page.total;
++      for (const op of page.operations) {
++        if (typeof op?.id !== "string" || !op.id.trim() || seen.has(op.id) ||
++            typeof op.status !== "string" || !op.status.trim()) throw new Error("invalid operation row");
++        seen.add(op.id);
++        if (!TERMINAL.has(op.status.toLowerCase())) active++;
++      }
++      if (seen.size === total) return active;
++    }
++    throw new Error("unknown operation coverage");
++  }
++
+   /**
+    * Poll each enqueued operation by id until terminal. LIST only shows active ops, so per-id GET is reliable.
+    *
+diff --git a/hindsight-integrations/coding-agents/src/core/hook.ts b/hindsight-integrations/coding-agents/src/core/hook.ts
+index 48a5edc..4bfd3da 100644
+--- a/hindsight-integrations/coding-agents/src/core/hook.ts
++++ b/hindsight-integrations/coding-agents/src/core/hook.ts
+@@ -224,6 +224,9 @@ export interface HookOutput {
+    *  SessionStart preamble from this too, so a turn can no longer be told both "no pages yet" and
+    *  a list of pages in the same context (#4607). Empty also signals a bank the engine never built. */
+   pages: PageRef[];
++  /** Optional host rendering surfaces; not used by the Codex envelope. */
++  memory?: string;
++  rosterRefreshed?: boolean;
+ }
+ 
+ /**
+@@ -236,6 +239,8 @@ export async function buildHookOutput(args: {
+   cfg: Config;
+   client: HookClient;
+   cacheFile: string;
++  deferInitialReflect?: boolean;
++  metadataOnlyCache?: boolean;
+ }): Promise<HookOutput> {
+   const { harness, prompt, cfg, client, cacheFile } = args;
+ 
+@@ -257,7 +262,7 @@ export async function buildHookOutput(args: {
+   let reflectFailed = false;
+   // Set when reflect timed out / 5xx'd and a retrieval-only fallback supplied the memory instead.
+   let fallback: string | null | undefined;
+-  const deferInitialReflect = cached.deferInitialReflect === true;
++  const deferInitialReflect = cached.deferInitialReflect ?? args.deferInitialReflect === true;
+   if (deferInitialReflect) {
+     // A new bank has no useful history yet. Do not burn the once-per-session synthesis on prompt
+     // one; this marker is deliberately consumed below so prompt two remains eligible to reflect.
+@@ -365,7 +370,7 @@ export async function buildHookOutput(args: {
+ 
+   writeSessionCache(cacheFile, {
+     turns,
+-    reflectAnswer,
++    reflectAnswer: args.metadataOnlyCache && reflectAnswer !== undefined ? "" : reflectAnswer,
+     reflectAttempts,
+     pages: { atTurn: stale ? turns : (cached.pages?.atTurn ?? turns), list: pages },
+   } satisfies SessionCache);
+@@ -418,7 +423,12 @@ export async function buildHookOutput(args: {
+     notice = `${brandWord()} · no memory this turn — see ${diagFilePath()}`;
+   }
+ 
+-  return { context: kept.length ? kept.join("\n\n") : undefined, notice, pages };
++  return { context: kept.length ? kept.join("\n\n") : undefined, notice, pages,
++    ...(args.metadataOnlyCache ? {
++      memory: reflectRanThisTurn ? reflectAnswer ?? "" : "",
++      rosterRefreshed: cadence > 0 && turns % cadence === 0,
++    } : {}),
++  };
+ }
+ 
+ /** Run one hook invocation: stdin event in, (maybe) an injection object on stdout. */
+diff --git a/hindsight-integrations/coding-agents/src/core/session-start.ts b/hindsight-integrations/coding-agents/src/core/session-start.ts
+index dbc2f9b..d9d7f8a 100644
+--- a/hindsight-integrations/coding-agents/src/core/session-start.ts
++++ b/hindsight-integrations/coding-agents/src/core/session-start.ts
+@@ -133,6 +133,7 @@ export interface SessionStartOutput {
+   additionalContext?: string;
+   /** Internal lifecycle signal: defer one auto-reflect while a new bank gains useful content. */
+   deferInitialReflect?: boolean;
++  pages?: PageRef[];
+ }
+ 
+ /** Host-specific adapter for the shared SessionStart core. Claude and Codex use the
+@@ -170,6 +171,8 @@ export async function buildSessionStartContext(args: {
+   harness?: string;
+   stateDir?: string;
+   hasGit?: (dir: string) => boolean;
++  /** Read-only host mode: probe emptiness without seeding or evaluating local Git commands. */
++  readOnlyRoster?: boolean;
+   startSeed?: (repoDir: string, opts?: { limit?: number; harness?: string }) => void;
+   startSurvey?: typeof startCodebaseSurvey;
+   headSha?: (dir: string) => string | null;
+@@ -228,7 +231,9 @@ export async function buildSessionStartContext(args: {
+   // The pages preamble is model context and stays in `additionalContext`.
+   let systemMessage: string | undefined;
+ 
+-  if (cfg.autoSeed !== false) {
++  const readOnlyColdCheck = args.readOnlyRoster && cfg.autoSeed !== false && cfg.autoInject === "reflect" && hasGit(cwd)
++    ? client.hasDocuments?.().then((has) => !has, () => false) : undefined;
++  if (!args.readOnlyRoster && cfg.autoSeed !== false) {
+     if (hasGit(cwd)) {
+       // The LIVE bank is the ONLY state (cold-check-wins): delete the bank and the next session is
+       // a true first-open — no client-side flags can contradict it. Opting out of memory is the
+@@ -357,7 +362,7 @@ export async function buildSessionStartContext(args: {
+   });
+   // An empty page roster is NOT an empty bank: a bank with memories and no pages still answers a
+   // reflect (#5209), so only the confirmed-empty probe above defers it.
+-  const deferInitialReflect = bankEmpty;
++  const deferInitialReflect = (await readOnlyColdCheck) ?? bankEmpty;
+ 
+   // The banner shows on EVERY session — Hindsight's presence is part of the product, not a
+   // one-time setup note. Wording tracks the bank state: cold = "learning", else "remembering";
+@@ -387,7 +392,7 @@ export async function buildSessionStartContext(args: {
+   // ALWAYS record the session start (warm sessions used to log nothing — undebuggable).
+   diag(harness, "session_start", { bank: bankId, cold, pages: pages.length, ms: Date.now() - t0 });
+ 
+-  return { systemMessage, additionalContext, deferInitialReflect };
++  return { systemMessage, additionalContext, deferInitialReflect, ...(args.readOnlyRoster ? { pages } : {}) };
+ }
+ 
+ /** Run one SessionStart hook invocation: stdin event in, (maybe) an additionalContext object on stdout. */

@@ -1,0 +1,13 @@
+diff --git a/hindsight-integrations/coding-agents/src/core/diag.ts b/hindsight-integrations/coding-agents/src/core/diag.ts
+index 1016616..3721d96 100644
+--- a/hindsight-integrations/coding-agents/src/core/diag.ts
++++ b/hindsight-integrations/coding-agents/src/core/diag.ts
+@@ -17,6 +17,8 @@ export function diagFilePath(): string {
+ }
+ 
+ export function diag(harness: string, event: string, extra: Record<string, unknown> = {}): void {
++  // The Hermes adapter emits its own metadata-only diagnostics. Do not persist query/answer bodies.
++  if (harness === "hermes") return;
+   log.debug(harness, `diag:${event}`, extra); // debug level shows the full story in ONE file
+   try {
+     appendLogLine(

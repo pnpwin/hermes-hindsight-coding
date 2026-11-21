@@ -1,0 +1,4 @@
+name: hermes-hindsight-coding
+version: 0.2.0
+description: "Project-scoped Hindsight Coding Agents memory for Hermes"
+requires_env: []

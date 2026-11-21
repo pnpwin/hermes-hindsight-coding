@@ -1,0 +1,288 @@
+diff --git a/hindsight-integrations/coding-agents/src/core/chat.ts b/hindsight-integrations/coding-agents/src/core/chat.ts
+index 535957b..e94d0cd 100644
+--- a/hindsight-integrations/coding-agents/src/core/chat.ts
++++ b/hindsight-integrations/coding-agents/src/core/chat.ts
+@@ -133,6 +133,7 @@ async function supportsAppend(client: HindsightClient): Promise<boolean> {
+ /** Short: this runs on every write-back that follows an accepted one, inside a hook's budget. */
+ const OP_CHECK_TIMEOUT_MS = 5_000;
+ const LOST_OP_STATUSES = new Set(["failed", "cancelled", "error"]);
++const TERMINAL_REPLACE = new Set(["completed", ...LOST_OP_STATUSES]);
+ 
+ /**
+  * Settle the cursor's accepted-but-unconfirmed operations (#5251). Returns the cursor to plan from —
+@@ -142,7 +143,8 @@ const LOST_OP_STATUSES = new Set(["failed", "cancelled", "error"]);
+  */
+ async function settleOps(
+   client: HindsightClient,
+-  cursor: RetainCursor
++  cursor: RetainCursor,
++  requireKnown = false
+ ): Promise<{ cursor: RetainCursor; ops: string[] }> {
+   const ops = cursor.ops ?? [];
+   const statuses = await Promise.all(
+@@ -155,16 +157,18 @@ async function settleOps(
+           [],
+           OP_CHECK_TIMEOUT_MS
+         );
+-        if (r.status === 404) return "not_found"; // pruned: nothing left to learn
++        if (r.status === 404) return requireKnown ? "" : "not_found"; // cannot prove a strict host's prefix
+         return String(((await r.json()) as { status?: unknown }).status ?? "").toLowerCase();
+       } catch {
+         return "";
+       }
+     })
+   );
++  if (requireKnown && statuses.some((status) => !status)) throw Error("unconfirmed prior retain operation");
+   const lost = statuses.some((s) => LOST_OP_STATUSES.has(s));
+-  const open = ops.filter((_, i) => !["completed", "not_found"].includes(statuses[i]));
+-  return { cursor: lost ? { ...cursor, dirty: true } : cursor, ops: lost ? [] : open };
++  const open = ops.filter((_, i) => !(requireKnown ? TERMINAL_REPLACE.has(statuses[i]) :
++    ["completed", "not_found"].includes(statuses[i])));
++  return { cursor: lost ? { ...cursor, dirty: true } : cursor, ops: lost && !requireKnown ? [] : open };
+ }
+ 
+ /** Retry window for a caller that did not supply one — a long-lived host with no external clock. */
+@@ -193,7 +197,8 @@ const REQUEST_BUDGET_MS = 15_000;
+ async function submitWithRetry(
+   send: () => Promise<void>,
+   isStillNewest: () => boolean,
+-  retryUntil: number
++  retryUntil: number,
++  requestBudgetMs = REQUEST_BUDGET_MS
+ ): Promise<void> {
+   for (let attempt = 0; ; attempt++) {
+     try {
+@@ -205,7 +210,7 @@ async function submitWithRetry(
+       // asked would just earn another 429. Whether it fits is the CALLER's clock, not a constant —
+       // a hook process is killed by its host at a known deadline, a long-lived runtime is not.
+       const wait = e.retryAfterMs || 1000;
+-      if (Date.now() + wait + REQUEST_BUDGET_MS > retryUntil) throw e;
++      if (Date.now() + wait + requestBudgetMs > retryUntil) throw e;
+       await sleep(wait);
+     }
+   }
+@@ -282,6 +287,8 @@ export async function retainLiveSession(
+     retryUntil?: number;
+     /** The transcript file the turns came from, when there is one — see RetainCursor.paths. */
+     transcriptPath?: string;
++    requestBudgetMs?: number;
++    stableReplaceReceipt?: boolean;
+   } = {}
+ ): Promise<void> {
+   const cursors = opts.cursors;
+@@ -295,7 +302,9 @@ export async function retainLiveSession(
+       opts.stamp,
+       undefined,
+       opts.retryUntil,
+-      opts.transcriptPath
++      opts.transcriptPath,
++      opts.requestBudgetMs,
++      opts.stableReplaceReceipt
+     );
+   // Serialised so the plan is made against the previous write-back's CONFIRMED cursor (see above).
+   return serialize(cursors, sessionId, () =>
+@@ -308,7 +317,9 @@ export async function retainLiveSession(
+       opts.stamp,
+       cursors,
+       opts.retryUntil,
+-      opts.transcriptPath
++      opts.transcriptPath,
++      opts.requestBudgetMs,
++      opts.stableReplaceReceipt
+     )
+   );
+ }
+@@ -323,11 +334,15 @@ async function writeSession(
+   cursors?: RetainCursorStore,
+   /** Absolute time this write-back may keep retrying until; the caller owns its own clock. */
+   retryUntil = Date.now() + DEFAULT_RETRY_WINDOW_MS,
+-  transcriptPath?: string
++  transcriptPath?: string,
++  requestBudgetMs = REQUEST_BUDGET_MS,
++  stableReplaceReceipt = false
+ ): Promise<void> {
+   if (!turns.length) return;
+   const refId = `conversation:${sessionId}`;
+-  let cursor = cursors?.read(sessionId);
++  const originalCursor = cursors?.read(sessionId);
++  let cursor = originalCursor;
++  const outstanding = cursor?.ops ?? [];
+   // A "yes" is remembered on the cursor: hook harnesses run a fresh process per Stop, so without it
+   // every turn re-asked, and one slow or failed probe turned that turn's append into a full replace
+   // (#4560). A "no" is not remembered — the server can be upgraded mid-session.
+@@ -348,8 +363,11 @@ async function writeSession(
+   // Only an append can build on a lost write; a replace already re-sends everything. The ops of a
+   // bank the session just left would be looked up in this one, so they are not checked.
+   let ops: string[] = [];
+-  if (appendSupported && cursor?.ops?.length && !cursor.dirty && !moved)
+-    ({ cursor, ops } = await settleOps(client, cursor));
++  if ((appendSupported || stableReplaceReceipt) && cursor?.ops?.length && !cursor.dirty && !moved)
++    ({ cursor, ops } = await settleOps(client, cursor, stableReplaceReceipt));
++  const sameCleanSnapshot = stableReplaceReceipt && cursor && !cursor.dirty && !cursor.pending?.length &&
++    cursor.turns === turns.length && cursor.fingerprint === fingerprintTurns(turns, turns.length);
++  if (sameCleanSnapshot) return;
+   const plan = planRetain(turns, cursor, {
+     appendSupported,
+     bank: client.bank,
+@@ -372,6 +390,7 @@ async function writeSession(
+   // anything new — the document only ever grows in transcript order. Buffered appends of the bank
+   // the session just left belong to THAT document, so they are never replayed into this one.
+   const outbox = plan.mode === "replace" || moved ? [] : (cursor?.pending ?? []);
++  const deferNewAppend = stableReplaceReceipt && plan.mode === "append" && outbox.length > 0;
+   if (plan.mode === "skip" && !outbox.length) return;
+ 
+   /** Identity of ONE payload: a resubmission of the same bytes is collapsed server-side into the
+@@ -413,8 +432,8 @@ async function writeSession(
+   // The position the cursor reaches once everything below has been applied. On a "skip" this is
+   // exactly where the cursor already is: skip means the transcript ends at cursor.turns.
+   const next = {
+-    turns: turns.length,
+-    fingerprint: fingerprintTurns(turns, turns.length),
++    turns: deferNewAppend ? cursor!.turns : turns.length,
++    fingerprint: deferNewAppend ? cursor!.fingerprint : fingerprintTurns(turns, turns.length),
+     bank: client.bank,
+     ...(paths ? { paths } : {}),
+     ...(segments ? { segments } : {}),
+@@ -433,6 +452,23 @@ async function writeSession(
+   };
+ 
+   if (plan.mode === "replace") {
++    if (stableReplaceReceipt && ops.length) throw Error("prior operation has not settled");
++    if (stableReplaceReceipt) {
++      for (const pending of cursor?.pending ?? []) {
++        // An unacknowledged append can still land. Do not replay deleted text to discover its state.
++        const r = await client.req("GET", client.bankUrl(`/operations/${encodeURIComponent(pending.operationId)}`));
++        if (!r.ok || !TERMINAL_REPLACE.has((await r.json() as { status?: string }).status ?? "")) {
++          throw Error("unconfirmed append prevents replacement");
++        }
++      }
++    }
++    if (stableReplaceReceipt && cursor?.replaceClaim && cursor.fingerprint !== next.fingerprint) {
++      // Do not race an older, possibly accepted replacement whose receipt was lost.
++      const status = await client.req("GET", client.bankUrl(`/operations/${encodeURIComponent(cursor.replaceClaim)}`));
++      if (!status.ok || !TERMINAL_REPLACE.has((await status.json() as { status?: string }).status ?? "")) {
++        throw Error("prior replacement has not settled");
++      }
++    }
+     // Only this bank's share: a session that moved here keeps its earlier turns in the bank they
+     // were written to (#5812). A move with nothing new since has no share to start a document with.
+     const share = bankTurns(turns, segments, client.bank);
+@@ -445,21 +481,35 @@ async function writeSession(
+     // when a session returns to an earlier branch (A → B → A), and the server acknowledges a
+     // completed id without applying it, leaving B stored (#5845). A retry still has the same base.
+     const base = cursor ? `${cursor.turns}\n${cursor.fingerprint}` : "";
+-    cursors?.write(sessionId, { ...next, dirty: true });
+-    const operationId = opId("replace", `${base}\n${content}`);
+-    await submitWithRetry(() => submit(content, operationId, false), stillOurs, retryUntil);
++    const remainingClaim = stableReplaceReceipt && cursor?.dirty && cursor.turns === next.turns &&
++      cursor.fingerprint === next.fingerprint ? cursor.replaceClaim : undefined;
++    const operationId = remainingClaim ?? opId("replace", `${base}\n${content}${stableReplaceReceipt ? `\n${outstanding.join(',')}` : ""}`);
++    cursors?.write(sessionId, { ...next, dirty: true, ...(stableReplaceReceipt ? { replaceClaim: operationId } : {}) });
++    try {
++      await submitWithRetry(() => submit(content, operationId, false), stillOurs, retryUntil, requestBudgetMs);
++    } catch (error) {
++      // Only a new claim whose attempts all returned explicit 429 is known not to be accepted.
++      // A replay can be rate-limited even when an earlier transport failure hid acceptance.
++      if (stableReplaceReceipt && !remainingClaim && error instanceof RateLimitedError && cursors?.clear) {
++        if (originalCursor) cursors.write(sessionId, originalCursor);
++        else cursors.clear(sessionId);
++      }
++      throw error;
++    }
+     ops = []; // the replace re-sends every turn, so nothing older can still lose any
+     cursors?.write(sessionId, accepted(operationId));
+     return;
+   }
+ 
+   const queue = [...outbox];
+-  if (plan.mode === "append") {
++  if (stableReplaceReceipt && ops.length) throw Error("prior operation has not settled");
++  if (plan.mode === "append" && !deferNewAppend) {
+     const content = turns
+       .slice(plan.fromTurn)
+       .map((t) => JSON.stringify(t))
+       .join("\n");
+-    queue.push({ content, operationId: opId("append", content), at: Date.now() });
++    const slot = stableReplaceReceipt ? `${plan.fromTurn}\n${fingerprintTurns(turns, plan.fromTurn)}\n${outstanding.join(',')}\n` : "";
++    queue.push({ content, operationId: opId("append", slot + content), at: Date.now() });
+   }
+ 
+   // Claim the position BEFORE the request, WITH the bytes: a rejected retain — or a process the
+@@ -475,13 +525,21 @@ async function writeSession(
+     // by its host at `retryUntil` (retain-hook's hostDeadline), and a flush that overruns it buys
+     // nothing. The first entry always goes out, so a chronically short budget still makes progress;
+     // whatever is left is already durable, so the next write-back sends it.
+-    if (i > 0 && Date.now() + REQUEST_BUDGET_MS > retryUntil) return;
++    if (i > 0 && Date.now() + requestBudgetMs > retryUntil) return;
+     const entry = queue[i];
+-    await submitWithRetry(
+-      () => submit(entry.content, entry.operationId, true),
+-      stillOurs,
+-      retryUntil
+-    );
++    try {
++      await submitWithRetry(
++        () => submit(entry.content, entry.operationId, true),
++        stillOurs,
++        retryUntil,
++        requestBudgetMs
++      );
++    } catch (error) {
++      if (stableReplaceReceipt && !outbox.length && i === 0 && originalCursor && error instanceof RateLimitedError) {
++        cursors?.write(sessionId, originalCursor);
++      }
++      throw error;
++    }
+     // Confirmed: drop it immediately, so a failure on a LATER entry cannot resubmit it as part of
+     // the next flush. Whatever is still queued when this throws is what the next flush replays.
+     const remaining = queue.slice(i + 1);
+diff --git a/hindsight-integrations/coding-agents/src/core/retain-cursor.ts b/hindsight-integrations/coding-agents/src/core/retain-cursor.ts
+index 7dde921..6bd56ec 100644
+--- a/hindsight-integrations/coding-agents/src/core/retain-cursor.ts
++++ b/hindsight-integrations/coding-agents/src/core/retain-cursor.ts
+@@ -87,6 +87,8 @@ export function pendingReplayable(cursor: RetainCursor, now: number): boolean {
+ }
+ 
+ export interface RetainCursor {
++  /** Optional host mode: retry the same replace with its original operation ID. */
++  replaceClaim?: string;
+   /** Turns the document holds once every `pending` entry has been applied — what the next append
+    *  must start from, whether those turns are already committed or still buffered. */
+   turns: number;
+@@ -231,6 +233,7 @@ export function planRetain(
+ export interface RetainCursorStore {
+   read(sessionId: string): RetainCursor | undefined;
+   write(sessionId: string, cursor: RetainCursor): void;
++  clear?(sessionId: string): void;
+ }
+ 
+ /** In-memory store for a long-lived host (opencode/kilo). */
+diff --git a/hindsight-integrations/coding-agents/src/core/retain-stamp.ts b/hindsight-integrations/coding-agents/src/core/retain-stamp.ts
+index 4d5fead..7bf4711 100644
+--- a/hindsight-integrations/coding-agents/src/core/retain-stamp.ts
++++ b/hindsight-integrations/coding-agents/src/core/retain-stamp.ts
+@@ -38,6 +38,9 @@ export interface RetainStampContext {
+   bankId: string;
+   /** Agent session when the document comes from one; absent for non-session documents. */
+   sessionId?: string;
++  /** Host-attested Git identity and stable transcript timestamp, when available. */
++  gitProject?: string;
++  timestamp?: string;
+ }
+ 
+ export interface RetainStamp {
+@@ -57,12 +60,12 @@ function resolversFor(ctx: RetainStampContext): Resolvers {
+   return {
+     // Worktree-aware like the bank id, so every linked worktree of a repo stamps the SAME name —
+     // otherwise a shared bank ends up with `project:app` and `project:app-wt2` for one repository.
+-    gitProject: () => projectNameOf(ctx.directory, ctx.sessionRoot),
++    gitProject: () => ctx.gitProject ?? projectNameOf(ctx.directory, ctx.sessionRoot),
+     project: () => (ctx.directory ? basename(ctx.directory) : "unknown"),
+     harness: () => ctx.harness,
+     bankId: () => ctx.bankId,
+     sessionId: () => ctx.sessionId ?? "unknown",
+-    timestamp: () => new Date().toISOString(),
++    timestamp: () => ctx.timestamp ?? new Date().toISOString(),
+     channel: () => process.env.HINDSIGHT_CHANNEL_ID || "default",
+     user: () => process.env.HINDSIGHT_USER_ID || "anonymous",
+   };

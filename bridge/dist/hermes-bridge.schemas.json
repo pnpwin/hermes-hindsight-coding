@@ -1,0 +1,100 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "hindsight_sync_status",
+      "description": "Report stored project memory and pending operations without running Git or writing to the bank.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "hindsight_diagnose",
+      "description": "Show the current coding-memory bank and loopback endpoint, without credentials.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "hindsight_search_pages",
+      "description": "Search this repository's Hindsight pages for content relevant to a query — hybrid full-text + semantic search, server-side. Call this when the user's question may be answered by the project's accumulated knowledge (architecture, conventions, decisions, initiatives) rather than by reading code. Returns ranked pages with a relevance snippet; read a full page with hindsight_read_page. Crediting is mandatory, not a judgement call: if anything these results contribute reaches your reply — quoted, paraphrased, or merely confirming what you were going to say — open that part with \"> 🧠 **From Hindsight memory (<page>)** — <the specific facts you drew on>\". Rewriting a snippet in your own words does not make it yours. If none of them bear on the turn, ignore them silently — an unhelpful search needs no mention. These are past records: check a claim that something was fixed or works against the code before relying on it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "hindsight_list_pages",
+      "description": "List this repository's Hindsight pages — curated, continuously-updated summaries of the project's durable knowledge (architecture, components, conventions, key decisions, and in-flight initiatives). Returns each page's id, title, and a one-line description of what it covers. Call this at the start of any non-trivial task, and again periodically in long sessions, to see what the project already knows before you read code or ask the user. The list changes as work is captured, so re-check it occasionally.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "hindsight_read_page",
+      "description": "Read the full content of one page by its id (from hindsight_list_pages). Call this whenever a listed page is relevant to what you're about to do — e.g. read Conventions before writing new code, Component map before changing a subsystem, or an initiative's page before continuing that feature. A page may contain [[page:<id>]] links to related pages; follow one by calling this tool again with that id. Prefer reading a page over re-deriving the same understanding from source.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "page_id": {
+            "type": "string",
+            "pattern": "^kp-[A-Za-z0-9_-]{1,189}$"
+          }
+        },
+        "required": [
+          "page_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "hindsight_reflect",
+      "description": "Deep memory reasoning: an agentic synthesis over this repository's FULL memory (git decisions, past sessions, ingested knowledge) that answers WHY questions — the past decision and exact rule/values that explain a behavior, bug, or convention. Slower than hindsight_search_pages (several seconds): reach for it when pages are too shallow and you need the root cause or the decided literals. When the answer informs your reply, credit it visibly with a blockquote header: \"> 🧠 **From Hindsight memory** — <summary>\".",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+]

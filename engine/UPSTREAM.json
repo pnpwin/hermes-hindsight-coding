@@ -1,0 +1,9 @@
+{
+  "package": "@vectorize-io/hindsight-coding-agents",
+  "version": "0.8.7",
+  "gitCommit": "329f8a5ac9baa5567f4516a24dc9fd0f753a75ae",
+  "distIntegrity": "sha512-GuGJdqvcPQpUuu9jWOjJa5OtaI/eAx20DgsiLKKEhfuSCDZXDBWH8Aa7lyj03dAVLMt40K7IciUBtD81QhdTBg==",
+  "source": "https://github.com/vectorize-io/hindsight.git",
+  "releaseTag": "integrations/coding-agents/v0.8.7",
+  "directory": "hindsight-integrations/coding-agents"
+}

@@ -1,0 +1,379 @@
+diff --git a/hindsight-integrations/coding-agents/src/core/bank.ts b/hindsight-integrations/coding-agents/src/core/bank.ts
+index f05ae9d..5dc3852 100644
+--- a/hindsight-integrations/coding-agents/src/core/bank.ts
++++ b/hindsight-integrations/coding-agents/src/core/bank.ts
+@@ -31,7 +31,7 @@ import { existsSync } from "node:fs";
+ import { homedir } from "node:os";
+ import { basename, dirname, join, normalize, sep } from "node:path";
+ import { diag } from "./diag";
+-import { probeGitLayout } from "./git-layout";
++import { probeGitLayout, type GitProbeIO } from "./git-layout";
+ import { log } from "./log";
+ import { applyTemplate } from "./template";
+ 
+@@ -43,6 +43,8 @@ export interface BankConfig {
+   resolveWorktrees?: boolean; // default true: worktrees share the main repo's bank
+   optInOnly?: boolean; // memory runs ONLY where opted in (see isOptedIn)
+   optInPaths?: string[]; // directories opted in, matched as prefixes
++  routingHome?: string; // trusted home used for ~ without inheriting the worker's filesystem state
++  repositorySnapshot?: ProjectRoot; // accepted only from an in-process host scope, never from JSON config
+ }
+ 
+ const DEFAULT_BANK_NAME = "coding";
+@@ -75,9 +77,9 @@ export class BankResolutionError extends Error {
+ }
+ 
+ /** Main-worktree root for a directory inside a git repo (worktree- and bare-repo-aware). */
+-export function resolveProjectRoot(directory: string): ProjectRoot {
++export function resolveProjectRoot(directory: string, io?: GitProbeIO): ProjectRoot {
+   if (!directory) return { status: "absent" };
+-  const layout = probeGitLayout(directory);
++  const layout = probeGitLayout(directory, io);
+   if (layout.status !== "resolved") return layout;
+   const commonDir = layout.commonDir;
+   // Clones + `git worktree add`: common-dir is `<main root>/.git`.
+@@ -173,9 +175,9 @@ function mainWorktreeRoot(directory: string, sessionRoot = ""): ProjectRoot {
+   return failure ?? { status: "absent" };
+ }
+ 
+-function gitProjectName(directory: string, resolveWorktrees: boolean, sessionRoot = ""): string {
++function gitProjectName(directory: string, resolveWorktrees: boolean, sessionRoot = "", snapshot?: ProjectRoot): string {
+   if (resolveWorktrees) {
+-    const projectRoot = mainWorktreeRoot(directory, sessionRoot);
++    const projectRoot = snapshot ?? mainWorktreeRoot(directory, sessionRoot);
+     if (projectRoot.status === "resolved") return basename(projectRoot.root);
+     // The fallback below is right for a directory outside any repository and WRONG for a failed
+     // probe inside one — for a linked worktree it names the worktree instead of the repo, forking
+@@ -196,8 +198,8 @@ function gitProjectName(directory: string, resolveWorktrees: boolean, sessionRoo
+ }
+ 
+ /** A configured directory, `~`-expanded and normalised, without a trailing separator. */
+-function configuredDir(dir: string): string {
+-  const expanded = dir === "~" || dir.startsWith("~/") ? join(homedir(), dir.slice(1)) : dir;
++function configuredDir(dir: string, home = homedir()): string {
++  const expanded = dir === "~" || dir.startsWith("~/") ? join(home, dir.slice(1)) : dir;
+   return normalize(expanded).replace(new RegExp(`\\${sep}+$`), "");
+ }
+ 
+@@ -207,11 +209,11 @@ function isWithin(directory: string, configured: string): boolean {
+ }
+ 
+ /** Longest-prefix match of `directory` against the map's absolute paths (exact or ancestor). */
+-function mapLookup<T>(map: Record<string, T>, directory: string): T | undefined {
++function mapLookup<T>(map: Record<string, T>, directory: string, home?: string): T | undefined {
+   const cwd = normalize(directory);
+   let best: { len: number; value: T } | undefined;
+   for (const [dir, value] of Object.entries(map)) {
+-    const p = configuredDir(dir);
++    const p = configuredDir(dir, home);
+     if (isWithin(cwd, p)) {
+       if (!best || p.length > best.len) best = { len: p.length, value };
+     }
+@@ -229,7 +231,7 @@ function lookupDirectories(config: BankConfig, directory: string, sessionRoot =
+   if (config.resolveWorktrees ?? true) {
+     // Deliberately failure-tolerant, unlike bank naming: approval and mapping fall back to the
+     // literal directory, which can only ever be narrower than the repo-wide answer.
+-    const projectRoot = mainWorktreeRoot(directory, sessionRoot);
++    const projectRoot = config.repositorySnapshot ?? mainWorktreeRoot(directory, sessionRoot);
+     const normalizedRoot = projectRoot.status === "resolved" ? normalize(projectRoot.root) : "";
+     if (normalizedRoot && normalizedRoot !== directories[0]) directories.push(normalizedRoot);
+   }
+@@ -252,20 +254,20 @@ function lookupDirectories(config: BankConfig, directory: string, sessionRoot =
+  * cannot express which work is allowed to be remembered. Under `optInOnly` an unlisted project is
+  * inert even then — a privacy switch has to fail closed.
+  */
+-export function isOptedIn(config: BankConfig, directory: string): boolean {
++export function isOptedIn(config: BankConfig, directory: string, sessionRoot?: string): boolean {
+   if (!config.optInOnly) return true;
+   if (!directory) return false;
+-  const directories = lookupDirectories(config, directory);
++  const directories = lookupDirectories(config, directory, sessionRoot);
+   if (
+     directories.some((candidate) =>
+       (config.optInPaths ?? []).some(
+-        (configured) => configured && isWithin(candidate, configuredDir(configured))
++        (configured) => configured && isWithin(candidate, configuredDir(configured, config.routingHome))
+       )
+     )
+   )
+     return true;
+   const pathMap = config.mapPathToBank;
+-  return Boolean(pathMap && directories.some((candidate) => mapLookup(pathMap, candidate)));
++  return Boolean(pathMap && directories.some((candidate) => mapLookup(pathMap, candidate, config.routingHome)));
+ }
+ 
+ /** The `paths.<prefix>` section for a directory, if any: longest prefix, checked against the
+@@ -274,11 +276,12 @@ export function isOptedIn(config: BankConfig, directory: string): boolean {
+ export function pathSection<T>(
+   config: BankConfig,
+   paths: Record<string, T> | undefined,
+-  directory: string
++  directory: string,
++  sessionRoot?: string
+ ): T | undefined {
+   if (!directory || !paths) return undefined;
+-  return lookupDirectories(config, directory)
+-    .map((candidate) => mapLookup(paths, candidate))
++  return lookupDirectories(config, directory, sessionRoot)
++    .map((candidate) => mapLookup(paths, candidate, config.routingHome))
+     .find((section) => section !== undefined);
+ }
+ 
+@@ -292,7 +295,7 @@ function mappedBank(
+   const pathMap = config.mapPathToBank;
+   if (!directory || !pathMap) return undefined;
+   return lookupDirectories(config, directory, sessionRoot)
+-    .map((candidate) => mapLookup(pathMap, candidate))
++    .map((candidate) => mapLookup(pathMap, candidate, config.routingHome))
+     .find((bank) => bank !== undefined);
+ }
+ 
+@@ -317,7 +320,7 @@ export function deriveBankId(
+   const resolvers: Record<string, () => string> = {
+     harness: () => harness,
+     project: () => dirName(directory),
+-    gitProject: () => gitProjectName(directory, config.resolveWorktrees ?? true, sessionRoot),
++    gitProject: () => gitProjectName(directory, config.resolveWorktrees ?? true, sessionRoot, config.repositorySnapshot),
+     channel: () => process.env.HINDSIGHT_CHANNEL_ID || "default",
+     user: () => process.env.HINDSIGHT_USER_ID || "anonymous",
+   };
+@@ -359,7 +362,7 @@ export function bankProjectName(
+   try {
+     // The IDENTICAL call `deriveBankId` makes for the placeholder, `resolveWorktrees` and
+     // `sessionRoot` included — a second, subtly different derivation is the bug being fixed.
+-    return gitProjectName(directory, config.resolveWorktrees ?? true, sessionRoot);
++    return gitProjectName(directory, config.resolveWorktrees ?? true, sessionRoot, config.repositorySnapshot);
+   } catch (error) {
+     if (error instanceof BankResolutionError) return undefined;
+     throw error;
+diff --git a/hindsight-integrations/coding-agents/src/core/config.ts b/hindsight-integrations/coding-agents/src/core/config.ts
+index 3e2a818..7a07bf3 100644
+--- a/hindsight-integrations/coding-agents/src/core/config.ts
++++ b/hindsight-integrations/coding-agents/src/core/config.ts
+@@ -302,6 +302,9 @@ export interface RawConfig {
+ 
+ /** Fully-resolved config: every field present. */
+ export interface Config {
++  /** Explicit host owner for ~ routing; absent preserves the normal process home. */
++  routingHome?: string;
++  repositorySnapshot?: import("./bank").ProjectRoot;
+   serverMode: "cloud" | "self-hosted" | "daemon";
+   /** The EFFECTIVE base URL. In daemon mode this is already 127.0.0.1:{apiPort}, so every caller
+    *  that builds a client keeps working without knowing which mode is active. */
+@@ -729,6 +732,8 @@ export interface LoadOptions {
+   harness?: string;
+   /** Explicit global-config path (default ~/.hindsight/coding-agent.json). */
+   path?: string;
++  /** Validated single-read snapshot for an isolated host; otherwise use the file loader. */
++  rawConfig?: RawConfig;
+ }
+ 
+ /** Apply one config layer (its top level, then its `harnesses.<name>` override) over `raw`. */
+@@ -866,7 +871,7 @@ export function loadConfig(opts: LoadOptions | string = {}): Config {
+   const o: LoadOptions = typeof opts === "string" ? { path: opts } : opts; // legacy: loadConfig(path)
+   // Env first so the FILE wins on any field it sets.
+   const withEnv = applyLayer({}, readEnvConfig(), o.harness);
+-  const raw = applyLayer(withEnv, readRaw(o.path ?? CONFIG_PATH), o.harness);
++  const raw = applyLayer(withEnv, o.rawConfig ?? readRaw(o.path ?? CONFIG_PATH), o.harness);
+   // The harness that ASKED is the correct fallback for an unset `harness` field — not a hardcoded
+   // "opencode", whose silent default misfiled every other harness's background seed into an
+   // `opencode::<project>` bank (#3247). An explicit `harness:` in the config file still wins.
+@@ -877,6 +882,8 @@ export function loadConfig(opts: LoadOptions | string = {}): Config {
+ /** Bank-resolution fields are meaningless inside a `banks.<id>` section (they can't change the id
+  *  that selected it) — strip them so a typo there can't silently re-route memory. */
+ const BANK_OVERRIDE_EXCLUDED = [
++  "routingHome",
++  "repositorySnapshot",
+   "bankId",
+   "bankIdTemplate",
+   "mapPathToBank",
+@@ -899,14 +906,15 @@ export function applyBankConfig(
+   resolvedId: string,
+   /** The directory the bank was resolved FROM. Supplying it enforces `optInOnly`; every entry
+    *  point already has it to hand, having just passed it to bank resolution. */
+-  directory?: string
++  directory?: string,
++  sessionRoot?: string
+ ): { cfg: Config; bankId: string } {
+   // Rides the `disabled` gate every entry point already checks after bank resolution, rather than
+   // adding a second thing eight call sites must remember — and that gate is known to stop the run
+   // before anything creates a bank.
+-  if (directory !== undefined && !isOptedIn(cfg, directory))
++  if (directory !== undefined && !isOptedIn(cfg, directory, sessionRoot))
+     return { cfg: { ...cfg, disabled: true }, bankId: resolvedId };
+-  const byPath = directory === undefined ? undefined : pathSection(cfg, cfg.paths, directory);
++  const byPath = directory === undefined ? undefined : pathSection(cfg, cfg.paths, directory, sessionRoot);
+   if (byPath) {
+     // A path entry never renames the bank: only `banks.<id>` may, below.
+     const { bank: _rename, ...rest } = overrideFields(byPath);
+diff --git a/hindsight-integrations/coding-agents/src/core/git-layout.ts b/hindsight-integrations/coding-agents/src/core/git-layout.ts
+index f3755d1..829145b 100644
+--- a/hindsight-integrations/coding-agents/src/core/git-layout.ts
++++ b/hindsight-integrations/coding-agents/src/core/git-layout.ts
+@@ -56,6 +56,14 @@ function sleepSync(ms: number): void {
+ 
+ class TransientProbeError extends Error {}
+ 
++export interface GitProbeIO {
++  entryKind(path: string): "dir" | "file" | "none";
++  readText(path: string): string | null;
++  canonical(path: string): string;
++  /** A privacy-gated host refuses ambiguous metadata rather than continuing up the tree. */
++  validateMarker?(holder: string, adminDir: string, layout: Extract<GitLayout, {status: "resolved"}>, pointer: boolean): void;
++}
++
+ /** `lstat` reduced to the three answers the walk cares about; transient failures propagate. */
+ function entryKind(path: string): "dir" | "file" | "none" {
+   try {
+@@ -87,27 +95,27 @@ function gitDirFromPointer(text: string, holder: string): string | null {
+ 
+ /** The repository-wide directory for a git directory: a linked worktree's own git directory names
+  *  it in `commondir`, everything else IS it. This single hop is what makes worktrees share a bank. */
+-function commonDirOf(gitDir: string): string {
++function commonDirOf(gitDir: string, io: GitProbeIO): string {
+   const pointer =
+-    entryKind(join(gitDir, "commondir")) === "file"
+-      ? readTextOrNull(join(gitDir, "commondir"))?.trim()
++    io.entryKind(join(gitDir, "commondir")) === "file"
++      ? io.readText(join(gitDir, "commondir"))?.trim()
+       : null;
+   if (!pointer) return gitDir;
+   return isAbsolute(pointer) ? pointer : resolve(gitDir, pointer);
+ }
+ 
+ /** `core.bare = true` in the repository's own config. */
+-function isBare(commonDir: string): boolean {
+-  const config = readTextOrNull(join(commonDir, "config"));
++function isBare(commonDir: string, io: GitProbeIO): boolean {
++  const config = io.readText(join(commonDir, "config"));
+   return config !== null && /^\s*bare\s*=\s*true\s*$/im.test(config);
+ }
+ 
+ /** A directory that IS a repository (no worktree, no `.git`): `git init --bare` output. */
+-function looksLikeBareRepository(directory: string): boolean {
++function looksLikeBareRepository(directory: string, io: GitProbeIO): boolean {
+   return (
+-    entryKind(join(directory, "HEAD")) === "file" &&
+-    entryKind(join(directory, "objects")) === "dir" &&
+-    entryKind(join(directory, "refs")) === "dir"
++    io.entryKind(join(directory, "HEAD")) === "file" &&
++    io.entryKind(join(directory, "objects")) === "dir" &&
++    io.entryKind(join(directory, "refs")) === "dir"
+   );
+ }
+ 
+@@ -122,28 +130,40 @@ function canonical(path: string): string {
+ /** A resolved answer, or null when the layout points at a directory that is no longer there — a
+  *  worktree whose administrative directory has been pruned. Naming THAT path would hand the bank
+  *  the worktree's own name, the exact outcome this file exists to prevent, so the walk goes on. */
+-function resolved(commonDir: string): GitLayout | null {
+-  if (entryKind(commonDir) !== "dir") return null;
+-  const canonicalDir = canonical(commonDir);
+-  return { status: "resolved", commonDir: canonicalDir, bare: isBare(canonicalDir) };
++function resolved(commonDir: string, io: GitProbeIO): GitLayout | null {
++  if (io.entryKind(commonDir) !== "dir") return null;
++  const canonicalDir = io.canonical(commonDir);
++  return { status: "resolved", commonDir: canonicalDir, bare: isBare(canonicalDir, io) };
+ }
+ 
+-function probeOnce(directory: string): GitLayout {
++const defaultIO: GitProbeIO = { entryKind, readText: readTextOrNull, canonical };
++
++function probeOnce(directory: string, io: GitProbeIO): GitLayout {
+   let current = resolve(directory);
+   for (;;) {
+     const dotGit = join(current, ".git");
+-    const kind = entryKind(dotGit);
++    const kind = io.entryKind(dotGit);
+     if (kind === "dir") {
+-      const layout = resolved(commonDirOf(dotGit));
+-      if (layout) return layout;
++      const layout = resolved(commonDirOf(dotGit, io), io);
++      if (layout) {
++        if (layout.status === "resolved") io.validateMarker?.(current, dotGit, layout, false);
++        return layout;
++      }
+     } else if (kind === "file") {
+-      const text = readTextOrNull(dotGit);
++      const text = io.readText(dotGit);
++      if (io.validateMarker && !/^gitdir: [^\x00-\x1f\x7f]+\r?\n?$/.test(text ?? "")) {
++        throw new TransientProbeError("invalid Git pointer");
++      }
+       const gitDir = text ? gitDirFromPointer(text, current) : null;
+-      const layout = gitDir ? resolved(commonDirOf(gitDir)) : null;
+-      if (layout) return layout;
++      const layout = gitDir ? resolved(commonDirOf(gitDir, io), io) : null;
++      if (layout && gitDir) {
++        if (layout.status === "resolved") io.validateMarker?.(current, gitDir, layout, true);
++        return layout;
++      }
+     }
+-    if (looksLikeBareRepository(current)) {
+-      const layout = resolved(current);
++    if (kind !== "none" && io.validateMarker) throw new TransientProbeError("invalid Git marker");
++    if (looksLikeBareRepository(current, io)) {
++      const layout = resolved(current, io);
+       if (layout) return layout;
+     }
+     const parent = dirname(current);
+@@ -158,13 +178,13 @@ function probeOnce(directory: string): GitLayout {
+  * Retries a transient failure (the class the old spawn hit constantly) before giving up, because
+  * giving up here is what costs a session its memory.
+  */
+-export function probeGitLayout(directory: string): GitLayout {
++export function probeGitLayout(directory: string, io: GitProbeIO = defaultIO): GitLayout {
+   if (!directory) return { status: "absent" };
+   let last = "";
+   for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+     if (attempt) sleepSync(BACKOFF_MS * attempt);
+     try {
+-      return probeOnce(directory);
++      return probeOnce(directory, io);
+     } catch (error) {
+       last = error instanceof TransientProbeError ? error.message : errorCode(error) || "unknown";
+     }
+diff --git a/hindsight-integrations/coding-agents/src/core/host-client.ts b/hindsight-integrations/coding-agents/src/core/host-client.ts
+index 50f433c..3fdb830 100644
+--- a/hindsight-integrations/coding-agents/src/core/host-client.ts
++++ b/hindsight-integrations/coding-agents/src/core/host-client.ts
+@@ -14,8 +14,8 @@
+  * `--harness` flags rather than from a workspace, and their process ends long before a credential
+  * can rotate under them.
+  */
+-import { applyBankConfig, loadConfig, type Config } from "./config";
+-import { bankProjectName, deriveBankIdOrSkip } from "./bank";
++import { applyBankConfig, loadConfig, type Config, type RawConfig } from "./config";
++import { bankProjectName, deriveBankIdOrSkip, type ProjectRoot } from "./bank";
+ import { HindsightClient } from "./hindsight";
+ 
+ /** A host's resolved memory: the config for THIS workspace, the bank it resolved to, and a client
+@@ -30,21 +30,24 @@ export interface HostMemory {
+  *  section for the bank that directory maps to, with `optInOnly` enforced. */
+ export function resolveHostConfig(
+   harness: string,
+-  directory: string
++  directory: string,
++  scope: { sessionRoot?: string; rawConfig?: RawConfig; routingHome?: string; repositorySnapshot?: ProjectRoot } = {}
+ ): { cfg: Config; bankId: string; project?: string } {
+-  const cfg0 = loadConfig({ harness });
++  const cfg0 = loadConfig({ harness, rawConfig: scope.rawConfig });
++  if (scope.routingHome) cfg0.routingHome = scope.routingHome;
++  if (scope.repositorySnapshot) cfg0.repositorySnapshot = scope.repositorySnapshot;
+   // A globally disabled plugin stops HERE, before bank derivation: `disabled` exists to be a
+   // zero-overhead baseline — the same agent with no memory — not merely a silent one. Callers
+   // return early on `cfg.disabled`, so the empty bank id never reaches a request.
+   if (cfg0.disabled) return { cfg: cfg0, bankId: "" };
+-  const bankId = deriveBankIdOrSkip(cfg0, directory, harness);
++  const bankId = deriveBankIdOrSkip(cfg0, directory, harness, scope.sessionRoot);
+   // An unidentifiable repository takes the same exit: no bank id is safer than a guessed one, and
+   // `disabled` is the signal every caller already handles (#3950).
+   if (bankId === null) return { cfg: { ...cfg0, disabled: true }, bankId: "" };
+-  const resolved = applyBankConfig(cfg0, bankId, directory);
++  const resolved = applyBankConfig(cfg0, bankId, directory, scope.sessionRoot);
+   // The repository the bank is ABOUT, for page scoping — the same rule as deepen.ts: only a bank
+   // that is this repo's, not one a `banks.<id>.bank` rename points several repos at (#4490).
+-  const project = resolved.bankId === bankId ? bankProjectName(resolved.cfg, directory) : undefined;
++  const project = resolved.bankId === bankId ? bankProjectName(resolved.cfg, directory, scope.sessionRoot) : undefined;
+   return { ...resolved, project };
+ }
+ 

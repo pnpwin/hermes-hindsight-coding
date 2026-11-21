@@ -1,0 +1,77 @@
+diff --git a/hindsight-integrations/coding-agents/src/core/git.ts b/hindsight-integrations/coding-agents/src/core/git.ts
+index cb0b3fa..52b8697 100644
+--- a/hindsight-integrations/coding-agents/src/core/git.ts
++++ b/hindsight-integrations/coding-agents/src/core/git.ts
+@@ -195,24 +195,20 @@ export async function ingestGit(
+  * (see appendGitLog), so neither the window's steps nor a merged branch rewrites what is stored.
+  */
+ export function gitLogText(repo: string, limit: number): string {
+-  let raw: string;
+   try {
+-    const total = Number(git(repo, "rev-list", "--count", "--no-merges", "HEAD").trim());
+-    const step = Math.max(1, Math.ceil(limit / 2));
+-    const start = total > limit ? Math.ceil((total - limit) / step) * step : 0;
+-    raw = git(
+-      repo,
+-      "log",
+-      `-n`,
+-      String(total - start),
+-      "--no-merges",
+-      "--reverse", // applied after -n: the newest N, printed oldest first
+-      "--date=short",
+-      GITLOG_FORMAT
+-    );
++    return renderGitMessageWindow((...args) => git(repo, ...args), "HEAD", limit);
+   } catch {
+     return ""; // no commits yet (or not a git repo) — caller handles empty
+   }
++}
++
++/** Narrow adapter surface: this runner is supplied by the host and operates on one pinned view. */
++export function renderGitMessageWindow(read: (...args: string[]) => string, revision: string, limit: number): string {
++  const total = Number(read("rev-list", "--count", "--no-merges", revision).trim());
++  if (!Number.isSafeInteger(total) || total <= 0) return "";
++  const step = Math.max(1, Math.ceil(limit / 2));
++  const start = total > limit ? Math.ceil((total - limit) / step) * step : 0;
++  const raw = read("log", "-n", String(total - start), "--no-merges", "--reverse", "--date=short", GITLOG_FORMAT, revision, "--");
+   return gitLogRecords(raw).join(GITLOG_DIVIDER);
+ }
+ 
+@@ -290,9 +286,10 @@ async function retainGitLog(
+   content: string,
+   opts: GitLogOpts,
+   head: string | null,
+-  append?: { operationId: string }
++  append?: { operationId: string },
++  snapshot?: { repoName: string; timestamp: string; operationId: string }
+ ): Promise<void> {
+-  const repoName = repoNameOf(repo);
++  const repoName = snapshot?.repoName ?? repoNameOf(repo);
+   // The gitlog-head:<sha> tag records the commit this document is written at: the deepen engine
+   // writes it again only when HEAD has moved past that commit (see gitLogIsCurrent), and an
+   // append starts from it (see appendGitLog). An append REPLACES the document's tags with these,
+@@ -319,14 +316,22 @@ async function retainGitLog(
+       // facts it pulls out of these messages. Previously no timestamp was passed at all: retain
+       // then stamped "now", the extraction prompt got `Event Date: Unknown`, and every fact landed
+       // with a null occurred_start/occurred_end — invisible to temporal search (#3602).
+-      timestamp: gitLogNewestAuthorDate(repo) ?? undefined,
++      timestamp: snapshot?.timestamp ?? gitLogNewestAuthorDate(repo) ?? undefined,
+       // `retain` only sets metadata when it is truthy, so an empty stamp sends none.
+       metadata: Object.keys(stamp?.metadata ?? {}).length ? stamp?.metadata : undefined,
+-      ...(append ? { updateMode: "append" as const, operationId: append.operationId } : {}),
++      ...(append ? { updateMode: "append" as const, operationId: append.operationId } :
++        snapshot ? { operationId: snapshot.operationId } : {}),
+     }
+   );
+ }
+ 
++/** Write a host-verified isolated snapshot; never probes Git or bootstraps configuration. */
++export function retainGitMessageSnapshot(client: HindsightClient, snapshot: {
++  repoName: string; head: string; timestamp: string; content: string; operationId: string;
++}, stamp: RetainStamp): Promise<void> {
++  return retainGitLog(client, "", snapshot.content, { limit: 0, stampFor: () => stamp }, snapshot.head, undefined, snapshot);
++}
++
+ /**
+  * Ingest the aggregated commit-message history (last `opts.limit` commits, no diffs) as ONE document —
+  * a single retain/extraction op, orders of magnitude cheaper than per-commit full-diff ingestion. The
