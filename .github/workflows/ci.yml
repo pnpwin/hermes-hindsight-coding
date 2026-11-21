@@ -17,9 +17,9 @@ jobs:
         run: |
           set -euo pipefail
           BUNDLE=bridge/dist/hermes-bridge.mjs
-          echo "$(cat "$BUNDLE.sha256")  $BUNDLE" | sha256sum -c -
+          echo "$(cat bridge/dist/hermes-bridge.sha256)  $BUNDLE" | sha256sum -c -
           node --check "$BUNDLE"
-          node "$BUNDLE" --schemas | cmp - <(cat "$BUNDLE.schemas.json")
+          node "$BUNDLE" --schemas | cmp - bridge/dist/hermes-bridge.schemas.json
       - name: Compile-check plugin python sources
         run: |
           python3 -m py_compile __init__.py settings.py provider.py tools.py retain.py seed.py session.py transcript.py prefetch.py bridge_client.py
