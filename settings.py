@@ -11,7 +11,7 @@ SETTING_FILE = Path('plugin-data') / NAME / 'config.json'
 MAX_CONFIG_BYTES = 64 * 1024
 FLAGS = ('writes', 'seed', 'survey', 'manage_bank_config')
 KEYS = frozenset(('config_path', 'allowed_roots', 'allowed_api_url', 'seed_bank_ids', 'create_missing_banks',
-                  'allow_bank_default_strategy', *FLAGS))
+                  'allow_bank_default_strategy', 'surfaces', *FLAGS))
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +26,7 @@ class Settings:
     seed_bank_ids: tuple[str, ...] = ()
     create_missing_banks: bool = False
     allow_bank_default_strategy: bool = False
+    surfaces: tuple[str, ...] = ('cli', 'tui', 'desktop')
 
 
 def _unique_object(pairs):
@@ -88,6 +89,11 @@ def load_settings(hermes_home) -> Settings | None:
         flags = {flag: data.get(flag, False) for flag in FLAGS}
         create = data.get('create_missing_banks', False)
         fallback = data.get('allow_bank_default_strategy', False)
+        raw_surfaces = data.get('surfaces', ['cli', 'tui', 'desktop'])
+        if (not isinstance(raw_surfaces, list) or not raw_surfaces or len(raw_surfaces) > 8 or
+                any(not isinstance(surface, str) or not surface.strip() or len(surface) > 32 for surface in raw_surfaces)):
+            return None
+        surfaces = tuple(dict.fromkeys(raw_surfaces))
         if type(create) is not bool or type(fallback) is not bool or any(type(value) is not bool for value in flags.values()):
             return None
         if not flags['writes'] and any(flags[flag] for flag in FLAGS[1:]):
@@ -99,7 +105,7 @@ def load_settings(hermes_home) -> Settings | None:
                 bool(seed_banks) != flags['seed'] or len(set(seed_banks)) != len(seed_banks)):
             return None
         return Settings(upstream, roots, _loopback_endpoint(data['allowed_api_url']), seed_bank_ids=tuple(seed_banks),
-                        create_missing_banks=create, allow_bank_default_strategy=fallback, **flags)
+                        create_missing_banks=create, allow_bank_default_strategy=fallback, surfaces=surfaces, **flags)
     except (OSError, ValueError, KeyError, RuntimeError):
         return None
 

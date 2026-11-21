@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  packaging-and-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.x'
+      - name: Verify committed bridge bundle matches its manifest and schemas
+        run: |
+          set -euo pipefail
+          BUNDLE=bridge/dist/hermes-bridge.mjs
+          echo "$(cat "$BUNDLE.sha256")  $BUNDLE" | sha256sum -c -
+          node --check "$BUNDLE"
+          node "$BUNDLE" --schemas | cmp - <(cat "$BUNDLE.schemas.json")
+      - name: Compile-check plugin python sources
+        run: |
+          python3 -m py_compile __init__.py settings.py provider.py tools.py retain.py seed.py session.py transcript.py prefetch.py bridge_client.py

@@ -92,14 +92,14 @@ class CodingAgentsMemoryProvider(MemoryProvider):
         if not isinstance(session_id, str) or not session_id.strip():
             return
         self.session_id = session_id
+        settings = load_settings(kwargs.get('hermes_home'))
+        if settings is None:
+            return
         self.inactive_reason = 'scope_refused'
         identity = kwargs.get('agent_identity')
         if (not isinstance(identity, str) or not identity.strip() or kwargs.get('agent_context') != 'primary'
-                or kwargs.get('platform') not in LOCAL_SURFACES or kwargs.get('parent_session_id')
+                or kwargs.get('platform') not in settings.surfaces or kwargs.get('parent_session_id')
                 or os.environ.get('HERMES_KANBAN_TASK') or not _local_execution()):
-            return
-        settings = load_settings(kwargs.get('hermes_home'))
-        if settings is None:
             return
         explicit = kwargs.get('cwd')
         scoped = _scoped_cwd()
