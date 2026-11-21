@@ -101,7 +101,8 @@ class CodingAgentsMemoryProvider(MemoryProvider):
         settings = load_settings(kwargs.get('hermes_home'))
         if settings is None:
             return
-        cwd = allowed_directory(settings, kwargs.get('cwd'))
+        explicit = kwargs.get('cwd')
+        cwd = allowed_directory(settings, _scoped_cwd() if explicit is None else explicit)
         if cwd is None:
             return
         self.session_cwd = cwd

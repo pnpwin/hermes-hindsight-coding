@@ -106,6 +106,44 @@ class RuntimeTest(test_prefetch.PrefetchFixture):
         self.assertEqual({schema['function']['name'] for schema in agent.tools
                           if schema.get('function', {}).get('name', '').startswith('hindsight_')}, READ_NAMES)
 
+    def test_desktop_diagnoses_with_policy_cwd_only(self):
+        from gateway.session_context import scoped_current_session_id
+        from gateway.session_policy import build_policy, policy_scope
+        from run_agent import AIAgent
+
+        sid = 'desktop-policy-cwd-fixture'
+        policy = build_policy(
+            {'source': 'gui', 'cwd': str(self.cwd), 'model': 'fixture-model'},
+            {'terminal': {'backend': 'local'}},
+        )
+        self.assertEqual(policy.platform, 'desktop')
+        with policy_scope(policy), scoped_current_session_id(sid), patch('agent.process_bootstrap.OpenAI'):
+            # gateway/session_execution.py does not pass cwd to AIAgent.
+            agent: Any = AIAgent(
+                api_key='fixture-key', base_url='http://127.0.0.1:1/v1',
+                provider='custom', model='fixture-model', quiet_mode=True,
+                skip_context_files=True, skip_background_review=True,
+                enabled_toolsets=['memory'], session_id=sid, platform=policy.platform,
+            )
+            try:
+                self.assertIsNone(agent.session_cwd)
+                manager = agent._memory_manager
+                assert manager is not None
+                provider, = manager.providers
+                result = self.invoke(agent, 'hindsight_diagnose', {})
+                self.assertEqual(result['bank_id'], 'coding-agent::project')
+                self.assertEqual(result['workspace'], str(self.cwd))
+                self.assertEqual(result['api_url'], self.api.origin)
+                saved = provider._store.load(sid)
+                assert saved is not None
+                self.assertEqual(saved.start_cwd, str(self.cwd))
+                self.assertEqual(saved.bank_id, result['bank_id'])
+                self.assertEqual(self.api.wire_requests, [])
+            finally:
+                if agent._memory_manager is not None:
+                    agent._memory_manager.shutdown_all()
+                agent.close()
+
     def test_packaged_provider_runs_real_agent_lifecycle(self):
         from gateway.session_context import scoped_current_session_id
 

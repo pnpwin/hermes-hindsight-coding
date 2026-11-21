@@ -65,7 +65,7 @@ def main():
                                 env=os.environ | {'HERMES_HOME': name}, capture_output=True, text=True, timeout=90)
     report = result.stdout + result.stderr
     print(report, end='')
-    if result.returncode or not re.search(r'(?m)^Ran 3 tests in ', report) or not re.search(r'(?m)^OK$', report):
+    if result.returncode or not re.search(r'(?m)^Ran 4 tests in ', report) or not re.search(r'(?m)^OK$', report):
         raise SystemExit(result.returncode or 1)
     print('PASS scope=mock bank=coding-agent::project provider=hermes-hindsight-coding')
 
