@@ -102,9 +102,19 @@ class CodingAgentsMemoryProvider(MemoryProvider):
         if settings is None:
             return
         explicit = kwargs.get('cwd')
-        cwd = allowed_directory(settings, _scoped_cwd() if explicit is None else explicit)
+        scoped = _scoped_cwd()
+        cwd = allowed_directory(settings, scoped if explicit is None else explicit)
         if cwd is None:
             return
+        if explicit is not None and scoped:
+            scoped_cwd = allowed_directory(settings, scoped)
+            try:
+                if scoped_cwd is None or not cwd.samefile(scoped_cwd):
+                    return
+            except OSError:
+                return
+            # Use the host's spelling for both initialization and subsequent workspace checks.
+            cwd = scoped_cwd
         self.session_cwd = cwd
         self.settings = settings
         if not self.is_available():

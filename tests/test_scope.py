@@ -70,6 +70,53 @@ class ScopeTest(ScopeFixture):
                 self.assertIsNone(p.settings)
                 self.assertIsNone(p.session_cwd)
 
+    def test_cwd_authorities_must_agree_on_the_allowed_physical_directory(self):
+        from agent.runtime_cwd import reset_session_cwd, set_session_cwd
+
+        alias = self.repo / 'nested-alias'
+        alias.symlink_to(self.cwd, target_is_directory=True)
+        cases = (
+            ('same allowed directory', self.cwd, str(self.cwd), self.cwd),
+            ('symlink matches physical directory', alias, str(self.cwd), self.cwd),
+            ('explicit only', self.cwd, '', self.cwd),
+            ('neither source', None, '', None),
+            ('empty explicit', '', str(self.cwd), None),
+            ('invalid explicit', '.', str(self.cwd), None),
+            ('explicit outside', self.outside, str(self.cwd), None),
+            ('unapproved scoped fallback', None, str(self.outside), None),
+            ('both allowed but different', self.repo, str(self.cwd), None),
+            ('scoped outside', self.cwd, str(self.outside), None),
+            ('scoped relative', self.cwd, '.', None),
+        )
+        for label, explicit, scoped, expected in cases:
+            with self.subTest(case=label):
+                token = set_session_cwd(scoped)
+                try:
+                    provider = self.initialize(cwd=explicit)
+                    self.assertEqual(provider.session_cwd, expected)
+                    if expected is None:
+                        self.assertIsNone(provider.settings)
+                        self.assertIsNone(provider.binding)
+                        self.assertIsNone(provider._bridge)
+                finally:
+                    reset_session_cwd(token)
+
+    def test_case_alias_can_confirm_the_same_allowed_directory(self):
+        from agent.runtime_cwd import reset_session_cwd, set_session_cwd
+
+        alias = self.cwd.with_name(self.cwd.name.upper())
+        if not alias.is_dir() or not alias.samefile(self.cwd):
+            self.skipTest('filesystem does not resolve case aliases')
+        for explicit, scoped in ((self.cwd, alias), (alias, self.cwd)):
+            with self.subTest(explicit=explicit.name, scoped=scoped.name):
+                token = set_session_cwd(str(scoped))
+                try:
+                    provider = self.initialize(cwd=explicit)
+                    self.assertIsNotNone(provider.settings)
+                    self.assertTrue(provider.session_cwd.samefile(self.cwd))
+                finally:
+                    reset_session_cwd(token)
+
     def test_selected_default_can_load_its_own_policy(self):
         p = self.initialize(agent_identity='default')
         self.assertIsNotNone(p.settings)
