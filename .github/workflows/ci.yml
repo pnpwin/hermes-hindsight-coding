@@ -19,7 +19,13 @@ jobs:
           BUNDLE=bridge/dist/hermes-bridge.mjs
           echo "$(cat bridge/dist/hermes-bridge.sha256)  $BUNDLE" | sha256sum -c -
           node --check "$BUNDLE"
-          node "$BUNDLE" --schemas | cmp - bridge/dist/hermes-bridge.schemas.json
+          node "$BUNDLE" --schemas > /tmp/live-schemas.json
+          python3 - <<'PY'
+          import json
+          live = json.load(open('/tmp/live-schemas.json'))
+          committed = json.load(open('bridge/dist/hermes-bridge.schemas.json'))
+          assert live == committed, 'schemas mismatch'
+          PY
       - name: Compile-check plugin python sources
         run: |
           python3 -m py_compile __init__.py settings.py provider.py tools.py retain.py seed.py session.py transcript.py prefetch.py bridge_client.py
